@@ -1,6 +1,5 @@
 import asyncio
 import itertools
-import logging
 import os
 from datetime import datetime, timedelta
 
@@ -11,9 +10,15 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.dispatcher import FSMContext
 
-from callbacks import task_cb
-from forms import TaskAddForm, TaskMenuForm
-from utils import DB_FILE, init_db, schedule_daily_task_deletion, time_format
+from callbacks import alert_cb, task_cb
+from forms import AlertAddForm, TaskAddForm, TaskMenuForm
+from utils import (
+    DB_FILE,
+    init_db,
+    schedule_daily_alert_deletion,
+    schedule_daily_task_deletion,
+    time_format,
+)
 
 dotenv.load_dotenv()
 
@@ -25,7 +30,7 @@ dp.middleware.setup(LoggingMiddleware())
 
 
 async def fetch_tasks(user_id: int):
-    tasks_message = "Your Tasks:\n"
+    tasks_message = "Your tasks:\n"
     keyboard = types.InlineKeyboardMarkup(row_width=3)
     has_tasks = False
 
@@ -61,6 +66,45 @@ async def fetch_tasks(user_id: int):
     return has_tasks, tasks_message, keyboard
 
 
+async def fetch_alerts(user_id: int):
+    alerts_message = "Your alerts:\n"
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    has_alerts = False
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT id, alert, alert_time, completed FROM alerts WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            buttons = []
+            alert_idx = 1
+            async for row in cursor:
+                alert_id, alert_time, alert, completed = row
+                status = "✅" if completed else "❌"
+                alerts_message += (
+                    f"{status} Alert {alert_idx}: {alert} ({alert_time})\n"
+                )
+
+                if not completed:
+                    button = types.InlineKeyboardButton(
+                        f"Alert {alert_idx}",
+                        callback_data=alert_cb.new(
+                            id=alert_id, time=alert_time, action="open_menu"
+                        ),
+                    )
+                    buttons.append(button)
+                    has_alerts = True
+
+                alert_idx += 1
+
+            while buttons:
+                row = buttons[: keyboard.row_width]
+                keyboard.row(*row)
+                buttons = buttons[keyboard.row_width :]
+
+    return has_alerts, alerts_message, keyboard
+
+
 # Alert time set command
 @dp.message_handler(commands=["set_alarm_time"])
 async def set_alarm_time(message: types.Message):
@@ -78,6 +122,43 @@ async def set_alarm_time(message: types.Message):
         await message.reply(
             "Please use the correct format HH:MM. For example, /set_alarm_time 09:30"
         )
+
+
+# Add alert
+@dp.message_handler(commands=["add_alert"], state=None)
+async def add_alert(message: types.Message):
+    await AlertAddForm.alert.set()
+    await message.reply("Please send me the alert description.")
+
+
+# Add alert
+@dp.message_handler(state=AlertAddForm.alert)
+async def add_alert_time(message: types.Message, state: FSMContext):
+    async with state.proxy() as data:
+        data["alert"] = message.text
+
+    await AlertAddForm.time.set()
+    await message.reply(
+        "Please send me the alert time in format HH:MM. For example, 09:30"
+    )
+
+
+# Adding single task
+@dp.message_handler(state=AlertAddForm.time)
+async def process_add_alert(message: types.Message, state: FSMContext):
+    async with state.proxy() as data:
+        data["time"] = message.text
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        alert_time = datetime.strptime(data["time"], time_format).time()
+        alert_time_str = alert_time.strftime(time_format)  # Convert to string
+        await db.execute(
+            "INSERT INTO alerts (user_id, alert, alert_time) VALUES (?, ?, ?)",
+            (message.from_user.id, data["alert"], alert_time_str),
+        )
+        await db.commit()
+    await state.finish()
+    await message.reply("Alert added!")
 
 
 # Start command
@@ -124,28 +205,7 @@ async def add_tasks(message: types.Message):
     await message.reply("Tasks added!")
 
 
-# Daily task reminder
-async def task_reminder():
-    while True:
-        now = datetime.now()
-        async with aiosqlite.connect(DB_FILE) as db:
-            async with db.execute("SELECT user_id, remind_time FROM users") as cursor:
-                users = await cursor.fetchall()
-                for user_id, remind_time_str in users:
-                    remind_time = datetime.strptime(remind_time_str, time_format).time()
-                    if (
-                        now.time() >= remind_time
-                        and now.time()
-                        < (
-                            datetime.combine(datetime.today(), remind_time)
-                            + timedelta(minutes=1)
-                        ).time()
-                    ):
-                        await remind_user_tasks(user_id)
-        await asyncio.sleep(60)  # Check every minute
-
-
-async def remind_user_tasks(user_id):
+async def remind_user_tasks(user_id: int):
     tasks_message = "Here is your daily task reminder:\n"
 
     async with aiosqlite.connect(DB_FILE) as db:
@@ -160,6 +220,24 @@ async def remind_user_tasks(user_id):
                     task_idx += 1
 
                 await bot.send_message(user_id, tasks_message)
+
+
+async def remind_user_alert(user_id: int, alert_id: int, alert: str, alert_time: str):
+    alert_message = f"You've got new alert for {alert_time}: {alert}"
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    # FIXME: ValueError: Symbol ':' is defined as the separator and can't be used in parts' values
+    alert_time_fix = alert_time.replace(":", "-")
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "✅",
+            callback_data=alert_cb.new(id=alert_id, time=alert_time_fix, action="done"),
+        ),
+        types.InlineKeyboardButton(
+            "💤",
+            callback_data=alert_cb.new(id=alert_id, time=alert_time_fix, action="snooze"),
+        ),
+    )
+    await bot.send_message(user_id, alert_message, reply_markup=keyboard)
 
 
 # TODO: show completed tasks separatly
@@ -189,6 +267,40 @@ async def back_to_tasks(query: types.CallbackQuery, callback_data: dict):
     )
     await query.answer(
         f"You have {'no' if not has_tasks else task_count} task{'s' if task_count > 1 else ''}!"
+    )
+
+
+# TODO: show completed alerts separatly
+@dp.message_handler(commands=["alerts"])
+async def show_alerts(message: types.Message):
+    has_alerts, alerts_message, keyboard = await fetch_alerts(
+        user_id=message.from_user.id
+    )
+
+    if not has_alerts:
+        alerts_message = "You have no alerts!"
+        await message.reply(alerts_message)
+    else:
+        await message.reply(alerts_message, reply_markup=keyboard)
+
+
+@dp.callback_query_handler(alert_cb.filter(action="show_alerts"))
+async def back_to_alerts(query: types.CallbackQuery, callback_data: dict):
+    has_alerts, alerts_message, keyboard = await fetch_alerts(
+        user_id=query.from_user.id
+    )
+
+    if not has_alerts:
+        alerts_message = "You have no alerts!"
+        await query.message.edit_text(alerts_message)
+    else:
+        await query.message.edit_text(alerts_message, reply_markup=keyboard)
+
+    alert_count = len(
+        list(itertools.chain.from_iterable(list(keyboard.values.values())[0]))
+    )
+    await query.answer(
+        f"You have {'no' if not has_alerts else alert_count} alert{'s' if alert_count > 1 else ''}!"
     )
 
 
@@ -301,12 +413,51 @@ async def delete_task(message: types.Message, state: FSMContext):
     await state.finish()
 
 
-if __name__ == "__main__":
-    # logging.basicConfig(level=logging.DEBUG)
+# Daily task reminder
+async def daily_reminder():
+    while True:
+        now = datetime.now()
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute("SELECT user_id, remind_time FROM users") as cursor:
+                users = await cursor.fetchall()
+                for user_id, remind_time_str in users:
+                    remind_time = datetime.strptime(remind_time_str, time_format).time()
+                    if (
+                        now.time() >= remind_time
+                        and now.time()
+                        < (
+                            datetime.combine(datetime.today(), remind_time)
+                            + timedelta(minutes=1)
+                        ).time()
+                    ):
+                        await remind_user_tasks(user_id)
 
+            async with db.execute(
+                "SELECT user_id, id, alert, alert_time FROM alerts"
+            ) as alert_cursor:
+                alerts = await alert_cursor.fetchall()
+                for user_id, alert_id, alert, alert_time_str in alerts:
+                    alert_time = datetime.strptime(alert_time_str, time_format).time()
+                    if (
+                        now.time() >= alert_time
+                        and now.time()
+                        < (
+                            datetime.combine(datetime.today(), alert_time)
+                            + timedelta(minutes=1)
+                        ).time()
+                    ) or True:
+                        await remind_user_alert(
+                            user_id, alert_id, alert, alert_time_str
+                        )
+
+        await asyncio.sleep(60)  # Check every minute
+
+
+if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
     loop.create_task(schedule_daily_task_deletion())
-    loop.create_task(task_reminder())
+    loop.create_task(schedule_daily_alert_deletion())
+    loop.create_task(daily_reminder())
 
     executor.start_polling(dp, skip_updates=True)

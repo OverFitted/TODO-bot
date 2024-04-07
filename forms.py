@@ -8,3 +8,8 @@ class TaskAddForm(StatesGroup):
 class TaskMenuForm(StatesGroup):
     editing = State()
     confirming_deletion = State()
+
+
+class AlertAddForm(StatesGroup):
+    alert = State()
+    time = State()
